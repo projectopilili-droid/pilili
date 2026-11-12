@@ -1,101 +1,95 @@
-import { createFileRoute } from "@tanstack/react-router";
-import { auth } from "@/lib/auth/server";
-import { runExecution } from "@/lib/server/execute";
-import type { AttachmentMeta, PowerId } from "@/lib/pilili/types";
-import { POWER_IDS } from "@/lib/pilili/types";
+import { getBearerToken } from "@/lib/auth/client";
+import { CLOSED_STREAM_MESSAGE, hasTerminal, READ_STREAM_MESSAGE } from "@/lib/client/stream-end";
+import type { AttachmentMeta, StreamEvent } from "@/lib/pilili/types";
 
-type Body = {
+export async function streamPilili(opts: {
   conversationId: string;
   message: string;
   power?: string | null;
   projectId?: string | null;
-  history?: { role: "user" | "assistant"; content: string }[];
-  attachments?: AttachmentMeta[];
+  history: { role: "user" | "assistant"; content: string }[];
+  attachments: AttachmentMeta[];
   idempotencyKey: string;
   context?: string;
-};
+  onEvent: (ev: StreamEvent) => void;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const seen: StreamEvent[] = [];
+  const emit = (ev: StreamEvent) => {
+    seen.push(ev);
+    opts.onEvent(ev);
+  };
 
-export const Route = createFileRoute("/api/pilili/stream")({
-  server: {
-    handlers: {
-      POST: async ({ request }) => {
-        const authHeader = request.headers.get("authorization");
-        const headers = new Headers(request.headers);
-        if (authHeader) headers.set("Authorization", authHeader);
-        const session = await auth.api.getSession({ headers });
-        const user = session?.user
-          ? { id: session.user.id, email: session.user.email ?? null }
-          : null;
-        if (!user) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), {
-            status: 401,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const bearer = getBearerToken();
+  if (bearer) headers.Authorization = `Bearer ${bearer}`;
 
-        let body: Body;
+  try {
+    const res = await fetch("/api/pilili/stream", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        conversationId: opts.conversationId,
+        message: opts.message,
+        power: opts.power,
+        projectId: opts.projectId,
+        history: opts.history,
+        attachments: opts.attachments,
+        idempotencyKey: opts.idempotencyKey,
+        context: opts.context,
+      }),
+      signal: opts.signal,
+    });
+
+    if (res.status === 401) {
+      emit({ type: "error", message: "Unauthorized", retryable: false });
+      return;
+    }
+    if (!res.ok || !res.body) {
+      const t = await res.text().catch(() => "");
+      emit({
+        type: "error",
+        message: t || "Não foi possível começar. Tenta outra vez.",
+        retryable: true,
+      });
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      if (opts.signal?.aborted) {
+        await reader.cancel().catch(() => {});
+        break;
+      }
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const chunks = buf.split("\n\n");
+      buf = chunks.pop() ?? "";
+      for (const chunk of chunks) {
+        const line = chunk
+          .split("\n")
+          .filter((l) => l.startsWith("data:"))
+          .map((l) => l.slice(5).trim())
+          .join("");
+        if (!line) continue;
         try {
-          body = (await request.json()) as Body;
+          emit(JSON.parse(line) as StreamEvent);
         } catch {
-          return new Response(JSON.stringify({ error: "Pedido inválido" }), {
-            status: 400,
-            headers: { "Content-Type": "application/json" },
-          });
+          /* a bad chunk is ignored; a stream with no terminal still fails below */
         }
-        if (!body.message?.trim() || !body.conversationId || !body.idempotencyKey) {
-          return new Response(JSON.stringify({ error: "Falta a mensagem." }), {
-            status: 400,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
+      }
+    }
+  } catch {
+    if (!hasTerminal(seen)) {
+      emit({ type: "error", message: READ_STREAM_MESSAGE, retryable: true });
+    }
+    return;
+  }
 
-        const power =
-          body.power && (POWER_IDS as readonly string[]).includes(body.power)
-            ? (body.power as PowerId)
-            : null;
-
-        const encoder = new TextEncoder();
-        const stream = new ReadableStream({
-          async start(controller) {
-            const write = (chunk: string) => {
-              try {
-                controller.enqueue(encoder.encode(chunk));
-              } catch {
-                /* a ligação já fechou */
-              }
-            };
-            try {
-              await runExecution({
-                userId: user.id,
-                email: user.email,
-                conversationId: body.conversationId,
-                message: body.message.trim().slice(0, 12000),
-                power,
-                projectId: body.projectId ?? null,
-                history: (body.history ?? []).slice(-12),
-                attachments: (body.attachments ?? []).slice(0, 4),
-                idempotencyKey: body.idempotencyKey,
-                context: typeof body.context === "string" ? body.context.slice(0, 4000) : null,
-                write,
-              });
-            } catch (err) {
-              const message = err instanceof Error ? err.message : "Falhou a execução.";
-              write(`data: ${JSON.stringify({ type: "error", message, retryable: true })}\n\n`);
-            } finally {
-              controller.close();
-            }
-          },
-        });
-
-        return new Response(stream, {
-          headers: {
-            "Content-Type": "text/event-stream; charset=utf-8",
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",
-            Connection: "keep-alive",
-          },
-        });
-      },
-    },
-  },
-});
+  if (!hasTerminal(seen)) {
+    emit({ type: "error", message: CLOSED_STREAM_MESSAGE, retryable: true });
+  }
+}
